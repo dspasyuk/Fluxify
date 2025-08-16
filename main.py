@@ -295,34 +295,12 @@ def update_dimensions(preset):
     return gr.update(), gr.update(), gr.update(interactive=True), gr.update(interactive=True)
 
 # Create Gradio interface
-with gr.Blocks(title="FLUX Image Generation", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🎨 FLUX Image Generation")
+with gr.Blocks(title="Fluxify", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🎨 Fluxify")
     gr.Markdown("Generate high-quality images using FLUX.1-dev model with advanced controls")
     
     with gr.Row():
         with gr.Column(scale=1):
-            # Prompt section
-            with gr.Group():
-                gr.Markdown("### 📝 Prompt")
-                
-                prompt_history = gr.Dropdown(
-                    choices=get_prompt_choices(),
-                    label="Recent Prompts",
-                    value="",
-                    interactive=True
-                )
-                
-                prompt = gr.Textbox(
-                    label="Prompt", 
-                    lines=4, 
-                    placeholder="Enter your detailed prompt here...",
-                    value=""
-                )
-                
-                with gr.Row():
-                    refresh_prompts = gr.Button("🔄 Refresh", size="sm")
-                    export_btn = gr.Button("📥 Export Prompts", size="sm")
-            
             # Image input
             image = gr.Image(
                 type="pil", 
@@ -397,6 +375,28 @@ with gr.Blocks(title="FLUX Image Generation", theme=gr.themes.Soft()) as demo:
                 clear_button = gr.Button("🧹 Clear Cache", variant="secondary", scale=1)
         
         with gr.Column(scale=2):
+            # Prompt section (now at top of right column)
+            with gr.Group():
+                gr.Markdown("### 📝 Prompt")
+                
+                prompt_history = gr.Dropdown(
+                    choices=get_prompt_choices(),
+                    label="Recent Prompts",
+                    value="",
+                    interactive=True
+                )
+                
+                prompt = gr.Textbox(
+                    label="Prompt", 
+                    lines=4, 
+                    placeholder="Enter your detailed prompt here...",
+                    value=""
+                )
+                
+                with gr.Row():
+                    refresh_prompts = gr.Button("🔄 Refresh", size="sm")
+                    export_btn = gr.Button("📥 Export Prompts", size="sm")
+            
             # Output section
             output_gallery = gr.Gallery(
                 label="Generated Images",
