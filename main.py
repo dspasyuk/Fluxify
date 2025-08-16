@@ -296,9 +296,9 @@ except Exception as e:
 PRESET_SIZES = {
     "Square (512x512)": (512, 512),
     "Square (1024x1024)": (1024, 1024),
-    "Portrait (832x1472)": (1472, 832),
-    "Landscape (1472x832)": (832, 1472),
-    "Widescreen (1920x1080)": (1080, 1920),
+    "Portrait (1472x832)": (1472, 832),
+    "Landscape (832x1472)": (832, 1472),
+    "Widescreen (1080x1920)": (1080, 1920),
     "Custom": None
 }
 
