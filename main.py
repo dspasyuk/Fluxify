@@ -1,5 +1,5 @@
 import torch
-from diffusers import FluxPipeline
+from diffusers import FluxPipeline, FluxImg2ImgPipeline
 from diffusers.quantizers import PipelineQuantizationConfig
 import os
 from datetime import datetime
@@ -16,8 +16,9 @@ prompts_dir = "prompts"
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(prompts_dir, exist_ok=True)
 
-# Global pipeline variable
+# Global pipeline variables
 pipe = None
+img2img_pipe = None
 pipeline_lock = threading.Lock()
 
 # Prompt history file
@@ -95,7 +96,7 @@ def initialize_pipeline():
     global pipe
     if pipe is None:
         try:
-            print("Loading FLUX pipeline...")
+            print("Loading FLUX text-to-image pipeline...")
             quantization_config = PipelineQuantizationConfig(
                 quant_backend="bitsandbytes_4bit",
                 quant_kwargs={
@@ -114,10 +115,40 @@ def initialize_pipeline():
             
             # Enable model CPU offload to save VRAM
             pipe.enable_model_cpu_offload()
-            print("Pipeline loaded successfully!")
+            print("Text-to-image pipeline loaded successfully!")
             
         except Exception as e:
             print(f"Error loading pipeline: {e}")
+            raise e
+
+def initialize_img2img_pipeline():
+    """Initialize the FLUX img2img pipeline"""
+    global img2img_pipe
+    if img2img_pipe is None:
+        try:
+            print("Loading FLUX image-to-image pipeline...")
+            quantization_config = PipelineQuantizationConfig(
+                quant_backend="bitsandbytes_4bit",
+                quant_kwargs={
+                    "load_in_4bit": True, 
+                    "bnb_4bit_quant_type": "nf4", 
+                    "bnb_4bit_compute_dtype": torch.bfloat16
+                },
+                components_to_quantize=["transformer"],
+            )
+            
+            img2img_pipe = FluxImg2ImgPipeline.from_pretrained(
+                "black-forest-labs/FLUX.1-dev",
+                quantization_config=quantization_config,
+                torch_dtype=torch.bfloat16
+            )
+            
+            # Enable model CPU offload to save VRAM
+            img2img_pipe.enable_model_cpu_offload()
+            print("Image-to-image pipeline loaded successfully!")
+            
+        except Exception as e:
+            print(f"Error loading img2img pipeline: {e}")
             raise e
 
 def cleanup_memory():
@@ -140,22 +171,31 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
         "height": int(height),
         "width": int(width),
         "num_inference_steps": int(num_inference_steps),
-        "strength": strength
+        "strength": strength,
+        "has_input_image": image is not None
     }
     save_prompt_to_history(prompt, settings)
     
     with pipeline_lock:  # Ensure thread safety
         try:
-            # Initialize pipeline if not already done
-            initialize_pipeline()
+            # Initialize appropriate pipeline
+            if image is not None:
+                initialize_img2img_pipeline()
+                current_pipe = img2img_pipe
+                pipe_type = "img2img"
+            else:
+                initialize_pipeline()
+                current_pipe = pipe
+                pipe_type = "txt2img"
             
             generated_images = []
             
-            for i in progress.tqdm(range(int(num_images)), desc="Generating images"):
+            for i in progress.tqdm(range(int(num_images)), desc=f"Generating images ({pipe_type})"):
                 try:
                     # Clear memory before each generation
                     cleanup_memory()
                     
+                    # Base parameters for both pipelines
                     pipe_kwargs = {
                         "prompt": prompt.strip(),
                         "guidance_scale": float(guidance_scale),
@@ -164,29 +204,31 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
                         "num_inference_steps": int(num_inference_steps),
                     }
                     
-                    if image is not None:
+                    # Add image-specific parameters for img2img
+                    if image is not None and pipe_type == "img2img":
                         pipe_kwargs["image"] = image
                         pipe_kwargs["strength"] = float(strength)
                     
                     # Generate image
                     with torch.inference_mode():
-                        result = pipe(**pipe_kwargs)
+                        result = current_pipe(**pipe_kwargs)
                         out = result.images[0]
                     
                     # Save the generated image with metadata
                     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                    filename = f"{output_dir}/{timestamp}_{i:03d}.png"
+                    filename = f"{output_dir}/{timestamp}_{i:03d}_{pipe_type}.png"
                     
                     # Save image metadata
                     metadata = {
                         "prompt": prompt.strip(),
                         "settings": settings,
                         "timestamp": timestamp,
-                        "filename": os.path.basename(filename)
+                        "filename": os.path.basename(filename),
+                        "pipeline_type": pipe_type
                     }
                     
                     # Save metadata as JSON
-                    metadata_file = f"{output_dir}/{timestamp}_{i:03d}_metadata.json"
+                    metadata_file = f"{output_dir}/{timestamp}_{i:03d}_{pipe_type}_metadata.json"
                     with open(metadata_file, 'w', encoding='utf-8') as f:
                         json.dump(metadata, f, indent=2, ensure_ascii=False)
                     
@@ -204,7 +246,7 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
             # Final cleanup
             cleanup_memory()
             
-            status_msg = f"Generated {len(generated_images)} images successfully!"
+            status_msg = f"Generated {len(generated_images)} images successfully using {pipe_type}!"
             return generated_images, status_msg
             
         except Exception as e:
@@ -230,9 +272,9 @@ def export_prompts():
     except Exception as e:
         return f"Error exporting prompts: {e}", None
 
-# Initialize pipeline on startup
+# Initialize pipelines on startup
 try:
-    initialize_pipeline()
+    initialize_pipeline()  # Load text-to-image by default
 except Exception as e:
     print(f"Failed to initialize pipeline: {e}")
 
@@ -442,3 +484,5 @@ if __name__ == "__main__":
         cleanup_memory()
         if pipe is not None:
             del pipe
+        if img2img_pipe is not None:
+            del img2img_pipe
