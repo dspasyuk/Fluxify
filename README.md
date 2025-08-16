@@ -1,4 +1,4 @@
-# Flux image generator 
+# Fluxify
 
 # Installation
 Download the project and run
