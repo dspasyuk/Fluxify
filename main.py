@@ -179,6 +179,7 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
     with pipeline_lock:  # Ensure thread safety
         try:
             # Initialize appropriate pipeline
+            progress(0, desc="Initializing pipeline...")
             if image is not None:
                 initialize_img2img_pipeline()
                 current_pipe = img2img_pipe
@@ -189,9 +190,13 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
                 pipe_type = "txt2img"
             
             generated_images = []
+            total_images = int(num_images)
             
-            for i in progress.tqdm(range(int(num_images)), desc=f"Generating images ({pipe_type})"):
+            for i in range(total_images):
                 try:
+                    # Update progress at the start of each image
+                    progress((i) / total_images, desc=f"Generating image {i+1}/{total_images} ({pipe_type})")
+                    
                     # Clear memory before each generation
                     cleanup_memory()
                     
@@ -210,9 +215,13 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
                         pipe_kwargs["strength"] = float(strength)
                     
                     # Generate image
+                    progress((i + 0.1) / total_images, desc=f"Processing image {i+1}/{total_images}...")
                     with torch.inference_mode():
                         result = current_pipe(**pipe_kwargs)
                         out = result.images[0]
+                    
+                    # Update progress after generation
+                    progress((i + 0.8) / total_images, desc=f"Saving image {i+1}/{total_images}...")
                     
                     # Save the generated image with metadata
                     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -239,11 +248,16 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
                     del result, out
                     cleanup_memory()
                     
+                    # Final progress update for this image
+                    progress((i + 1) / total_images, desc=f"Completed image {i+1}/{total_images}")
+                    
                 except Exception as e:
                     print(f"Error generating image {i}: {e}")
+                    progress((i + 1) / total_images, desc=f"Error on image {i+1}/{total_images}")
                     continue
             
-            # Final cleanup
+            # Final cleanup and completion
+            progress(1.0, desc="Finalizing...")
             cleanup_memory()
             
             status_msg = f"Generated {len(generated_images)} images successfully using {pipe_type}!"
@@ -280,6 +294,7 @@ except Exception as e:
 
 # Preset dimensions
 PRESET_SIZES = {
+    "Square (512x512)": (512, 512),
     "Square (1024x1024)": (1024, 1024),
     "Portrait (832x1472)": (832, 1472),
     "Landscape (1472x832)": (1472, 832),
@@ -290,12 +305,18 @@ PRESET_SIZES = {
 def update_dimensions(preset):
     """Update width/height based on preset selection"""
     if preset in PRESET_SIZES and PRESET_SIZES[preset]:
-        width, height = PRESET_SIZES[preset]
-        return gr.update(value=height), gr.update(value=width), gr.update(interactive=preset=="Custom"), gr.update(interactive=preset=="Custom")
-    return gr.update(), gr.update(), gr.update(interactive=True), gr.update(interactive=True)
+        height, width = PRESET_SIZES[preset]  # Fixed: was width, height
+        return (
+            gr.update(value=height, interactive=preset=="Custom"),
+            gr.update(value=width, interactive=preset=="Custom")
+        )
+    return (
+        gr.update(interactive=True),
+        gr.update(interactive=True)
+    )
 
 # Create Gradio interface
-with gr.Blocks(title="Fluxify", theme=gr.themes.Soft()) as demo:
+with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.colors.red, secondary_hue=gr.themes.colors.pink)) as demo:
     gr.Markdown("# 🎨 Fluxify")
     gr.Markdown("Generate high-quality images using FLUX.1-dev model with advanced controls")
     
@@ -425,11 +446,11 @@ with gr.Blocks(title="Fluxify", theme=gr.themes.Soft()) as demo:
     
     # Event handlers
     
-    # Update dimensions when preset changes
+    # Update dimensions when preset changes - FIXED EVENT HANDLER
     size_preset.change(
         fn=update_dimensions,
         inputs=[size_preset],
-        outputs=[height, width, height, width]
+        outputs=[height, width]  # Fixed: removed duplicate height, width
     )
     
     # Load prompt when selected from history
