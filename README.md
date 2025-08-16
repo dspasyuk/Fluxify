@@ -29,5 +29,6 @@ Open `http://localhost:7860` in your browser or use provided public url.
 - ~30GB disk space for model and about 16 Gb of VRAM 
 
 
-<img width="1169" height="878" alt="image" src="https://github.com/user-attachments/assets/4361ddd7-e387-43bf-9175-ec60e529984b" />
+<img width="1998" height="1179" alt="image" src="https://github.com/user-attachments/assets/9f31f908-0930-453b-a715-847d29bdcf90" />
+
 
