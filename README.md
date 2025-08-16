@@ -25,8 +25,8 @@ Open `http://localhost:7860` in your browser or use provided public url.
 
 ## Requirements
 - Python 3.8+
-- CUDA GPU recommended (works on CPU)
-- ~16GB disk space for model
+- CUDA GPU recommended (works on CPU) 
+- ~30GB disk space for model and about 16 Gb of VRAM 
 
 
 <img width="1169" height="878" alt="image" src="https://github.com/user-attachments/assets/4361ddd7-e387-43bf-9175-ec60e529984b" />
