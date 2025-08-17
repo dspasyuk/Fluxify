@@ -9,6 +9,7 @@ import gc
 import threading
 import time
 import json
+import psutil
 
 # Create output folder if it doesn't exist
 output_dir = "output"
@@ -16,13 +17,141 @@ prompts_dir = "prompts"
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(prompts_dir, exist_ok=True)
 
-# Global pipeline variables
-pipe = None
-img2img_pipe = None
+# Global pipeline variables - Now we only keep one pipeline loaded at a time
+current_pipeline = None
+current_pipeline_type = None
 pipeline_lock = threading.Lock()
 
 # Prompt history file
 PROMPTS_FILE = os.path.join(prompts_dir, "prompt_history.json")
+
+def get_memory_usage():
+    """Get current memory usage for monitoring"""
+    if torch.cuda.is_available():
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory
+        gpu_allocated = torch.cuda.memory_allocated(0)
+        gpu_cached = torch.cuda.memory_reserved(0)
+        return {
+            "gpu_total": gpu_memory / 1024**3,
+            "gpu_allocated": gpu_allocated / 1024**3, 
+            "gpu_cached": gpu_cached / 1024**3,
+            "ram_percent": psutil.virtual_memory().percent
+        }
+    return {"ram_percent": psutil.virtual_memory().percent}
+
+def aggressive_cleanup():
+    """More aggressive memory cleanup"""
+    global current_pipeline
+    
+    # Force garbage collection multiple times
+    for _ in range(3):
+        gc.collect()
+    
+    if torch.cuda.is_available():
+        # Clear CUDA cache multiple times
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        
+        # Reset peak memory stats
+        torch.cuda.reset_peak_memory_stats()
+    
+    # Small delay to allow system to catch up
+    time.sleep(0.5)
+
+def unload_current_pipeline():
+    """Properly unload the current pipeline"""
+    global current_pipeline, current_pipeline_type
+    
+    if current_pipeline is not None:
+        print(f"Unloading {current_pipeline_type} pipeline...")
+        
+        # Move components to CPU before deletion
+        try:
+            if hasattr(current_pipeline, 'transformer'):
+                current_pipeline.transformer.to('cpu')
+            if hasattr(current_pipeline, 'vae'):
+                current_pipeline.vae.to('cpu')
+            if hasattr(current_pipeline, 'text_encoder'):
+                current_pipeline.text_encoder.to('cpu')
+            if hasattr(current_pipeline, 'text_encoder_2'):
+                current_pipeline.text_encoder_2.to('cpu')
+        except Exception as e:
+            print(f"Warning: Error moving components to CPU: {e}")
+        
+        # Delete the pipeline
+        del current_pipeline
+        current_pipeline = None
+        current_pipeline_type = None
+        
+        # Aggressive cleanup
+        aggressive_cleanup()
+        
+        print("Pipeline unloaded successfully")
+
+def load_pipeline(pipeline_type):
+    """Load the specified pipeline type, unloading current one if different"""
+    global current_pipeline, current_pipeline_type
+    
+    if current_pipeline_type == pipeline_type and current_pipeline is not None:
+        print(f"{pipeline_type} pipeline already loaded")
+        return current_pipeline
+    
+    # Unload current pipeline if it's different
+    if current_pipeline is not None:
+        unload_current_pipeline()
+    
+    # Memory check before loading
+    mem_info = get_memory_usage()
+    print(f"Memory before loading: RAM {mem_info.get('ram_percent', 0):.1f}%")
+    if 'gpu_allocated' in mem_info:
+        print(f"GPU: {mem_info['gpu_allocated']:.1f}GB allocated, {mem_info['gpu_cached']:.1f}GB cached")
+    
+    try:
+        print(f"Loading {pipeline_type} pipeline...")
+        
+        quantization_config = PipelineQuantizationConfig(
+            quant_backend="bitsandbytes_4bit",
+            quant_kwargs={
+                "load_in_4bit": True, 
+                "bnb_4bit_quant_type": "nf4", 
+                "bnb_4bit_compute_dtype": torch.bfloat16
+            },
+            components_to_quantize=["transformer"],
+        )
+        
+        if pipeline_type == "txt2img":
+            current_pipeline = FluxPipeline.from_pretrained(
+                "black-forest-labs/FLUX.1-dev",
+                quantization_config=quantization_config,
+                torch_dtype=torch.bfloat16
+            )
+        else:  # img2img
+            current_pipeline = FluxImg2ImgPipeline.from_pretrained(
+                "black-forest-labs/FLUX.1-dev",
+                quantization_config=quantization_config,
+                torch_dtype=torch.bfloat16
+            )
+        
+        # Enable model CPU offload to save VRAM
+        current_pipeline.enable_model_cpu_offload()
+        current_pipeline_type = pipeline_type
+        
+        # Memory check after loading
+        mem_info = get_memory_usage()
+        print(f"Memory after loading: RAM {mem_info.get('ram_percent', 0):.1f}%")
+        if 'gpu_allocated' in mem_info:
+            print(f"GPU: {mem_info['gpu_allocated']:.1f}GB allocated, {mem_info['gpu_cached']:.1f}GB cached")
+        
+        print(f"{pipeline_type} pipeline loaded successfully!")
+        return current_pipeline
+        
+    except Exception as e:
+        print(f"Error loading {pipeline_type} pipeline: {e}")
+        current_pipeline = None
+        current_pipeline_type = None
+        aggressive_cleanup()
+        raise e
 
 def load_prompt_history():
     """Load prompt history from JSON file"""
@@ -91,79 +220,14 @@ def load_prompt_settings(selected_prompt):
             )
     return selected_prompt, 3.5, 832, 1472, 10, 0.8
 
-def initialize_pipeline():
-    """Initialize the FLUX pipeline with proper error handling"""
-    global pipe
-    if pipe is None:
-        try:
-            print("Loading FLUX text-to-image pipeline...")
-            quantization_config = PipelineQuantizationConfig(
-                quant_backend="bitsandbytes_4bit",
-                quant_kwargs={
-                    "load_in_4bit": True, 
-                    "bnb_4bit_quant_type": "nf4", 
-                    "bnb_4bit_compute_dtype": torch.bfloat16
-                },
-                components_to_quantize=["transformer"],
-            )
-            
-            pipe = FluxPipeline.from_pretrained(
-                "black-forest-labs/FLUX.1-dev",
-                quantization_config=quantization_config,
-                torch_dtype=torch.bfloat16
-            )
-            
-            # Enable model CPU offload to save VRAM
-            pipe.enable_model_cpu_offload()
-            print("Text-to-image pipeline loaded successfully!")
-            
-        except Exception as e:
-            print(f"Error loading pipeline: {e}")
-            raise e
-
-def initialize_img2img_pipeline():
-    """Initialize the FLUX img2img pipeline"""
-    global img2img_pipe
-    if img2img_pipe is None:
-        try:
-            print("Loading FLUX image-to-image pipeline...")
-            quantization_config = PipelineQuantizationConfig(
-                quant_backend="bitsandbytes_4bit",
-                quant_kwargs={
-                    "load_in_4bit": True, 
-                    "bnb_4bit_quant_type": "nf4", 
-                    "bnb_4bit_compute_dtype": torch.bfloat16
-                },
-                components_to_quantize=["transformer"],
-            )
-            
-            img2img_pipe = FluxImg2ImgPipeline.from_pretrained(
-                "black-forest-labs/FLUX.1-dev",
-                quantization_config=quantization_config,
-                torch_dtype=torch.bfloat16
-            )
-            
-            # Enable model CPU offload to save VRAM
-            img2img_pipe.enable_model_cpu_offload()
-            print("Image-to-image pipeline loaded successfully!")
-            
-        except Exception as e:
-            print(f"Error loading img2img pipeline: {e}")
-            raise e
-
-def cleanup_memory():
-    """Aggressive memory cleanup"""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    gc.collect()
-    time.sleep(0.1)  # Small delay to allow cleanup
-
 def generate_images(prompt, image, num_images, guidance_scale, height, width, 
                    num_inference_steps, strength, progress=gr.Progress()):
     """Generate images with proper progress tracking and memory management"""
     if not prompt or prompt.strip() == "":
         return [], "Please enter a prompt"
+    
+    # Determine pipeline type based on whether image is provided
+    pipeline_type = "img2img" if image is not None else "txt2img"
     
     # Save prompt and settings to history
     settings = {
@@ -178,16 +242,9 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
     
     with pipeline_lock:  # Ensure thread safety
         try:
-            # Initialize appropriate pipeline
-            progress(0, desc="Initializing pipeline...")
-            if image is not None:
-                initialize_img2img_pipeline()
-                current_pipe = img2img_pipe
-                pipe_type = "img2img"
-            else:
-                initialize_pipeline()
-                current_pipe = pipe
-                pipe_type = "txt2img"
+            # Load appropriate pipeline (this will unload the other if needed)
+            progress(0, desc=f"Loading {pipeline_type} pipeline...")
+            pipe = load_pipeline(pipeline_type)
             
             generated_images = []
             total_images = int(num_images)
@@ -195,10 +252,12 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
             for i in range(total_images):
                 try:
                     # Update progress at the start of each image
-                    progress((i) / total_images, desc=f"Generating image {i+1}/{total_images} ({pipe_type})")
+                    progress((i) / total_images, desc=f"Generating image {i+1}/{total_images} ({pipeline_type})")
                     
-                    # Clear memory before each generation
-                    cleanup_memory()
+                    # Clear memory before each generation (but don't unload pipeline)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
                     
                     # Base parameters for both pipelines
                     pipe_kwargs = {
@@ -210,14 +269,14 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
                     }
                     
                     # Add image-specific parameters for img2img
-                    if image is not None and pipe_type == "img2img":
+                    if image is not None and pipeline_type == "img2img":
                         pipe_kwargs["image"] = image
                         pipe_kwargs["strength"] = float(strength)
                     
                     # Generate image
                     progress((i + 0.1) / total_images, desc=f"Processing image {i+1}/{total_images}...")
                     with torch.inference_mode():
-                        result = current_pipe(**pipe_kwargs)
+                        result = pipe(**pipe_kwargs)
                         out = result.images[0]
                     
                     # Update progress after generation
@@ -225,7 +284,7 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
                     
                     # Save the generated image with metadata
                     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                    filename = f"{output_dir}/{timestamp}_{i:03d}_{pipe_type}.png"
+                    filename = f"{output_dir}/{timestamp}_{i:03d}_{pipeline_type}.png"
                     
                     # Save image metadata
                     metadata = {
@@ -233,20 +292,22 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
                         "settings": settings,
                         "timestamp": timestamp,
                         "filename": os.path.basename(filename),
-                        "pipeline_type": pipe_type
+                        "pipeline_type": pipeline_type
                     }
                     
                     # Save metadata as JSON
-                    metadata_file = f"{output_dir}/{timestamp}_{i:03d}_{pipe_type}_metadata.json"
+                    metadata_file = f"{output_dir}/{timestamp}_{i:03d}_{pipeline_type}_metadata.json"
                     with open(metadata_file, 'w', encoding='utf-8') as f:
                         json.dump(metadata, f, indent=2, ensure_ascii=False)
                     
                     out.save(filename)
                     generated_images.append(filename)
                     
-                    # Clear references
+                    # Clear references and do lighter cleanup
                     del result, out
-                    cleanup_memory()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
                     
                     # Final progress update for this image
                     progress((i + 1) / total_images, desc=f"Completed image {i+1}/{total_images}")
@@ -258,21 +319,43 @@ def generate_images(prompt, image, num_images, guidance_scale, height, width,
             
             # Final cleanup and completion
             progress(1.0, desc="Finalizing...")
-            cleanup_memory()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
             
-            status_msg = f"Generated {len(generated_images)} images successfully using {pipe_type}!"
+            # Memory status
+            mem_info = get_memory_usage()
+            status_msg = f"Generated {len(generated_images)} images successfully using {pipeline_type}! "
+            status_msg += f"RAM: {mem_info.get('ram_percent', 0):.1f}%"
+            if 'gpu_allocated' in mem_info:
+                status_msg += f", GPU: {mem_info['gpu_allocated']:.1f}GB"
+            
             return generated_images, status_msg
             
         except Exception as e:
             error_msg = f"Error in generate_images: {e}"
             print(error_msg)
-            cleanup_memory()
+            aggressive_cleanup()
             return [], error_msg
 
 def clear_cache():
-    """Manual cache clearing function"""
-    cleanup_memory()
-    return "Cache cleared!"
+    """Manual cache clearing function with pipeline unloading option"""
+    aggressive_cleanup()
+    mem_info = get_memory_usage()
+    status = f"Cache cleared! RAM: {mem_info.get('ram_percent', 0):.1f}%"
+    if 'gpu_allocated' in mem_info:
+        status += f", GPU: {mem_info['gpu_allocated']:.1f}GB allocated"
+    return status
+
+def force_unload_pipeline():
+    """Completely unload current pipeline"""
+    with pipeline_lock:
+        unload_current_pipeline()
+        mem_info = get_memory_usage()
+        status = f"Pipeline unloaded! RAM: {mem_info.get('ram_percent', 0):.1f}%"
+        if 'gpu_allocated' in mem_info:
+            status += f", GPU: {mem_info['gpu_allocated']:.1f}GB allocated"
+        return status
 
 def export_prompts():
     """Export all prompts to a downloadable JSON file"""
@@ -285,12 +368,6 @@ def export_prompts():
         return f"Prompts exported to {export_file}", export_file
     except Exception as e:
         return f"Error exporting prompts: {e}", None
-
-# Initialize pipelines on startup
-try:
-    initialize_pipeline()  # Load text-to-image by default
-except Exception as e:
-    print(f"Failed to initialize pipeline: {e}")
 
 # Preset dimensions
 PRESET_SIZES = {
@@ -305,7 +382,7 @@ PRESET_SIZES = {
 def update_dimensions(preset):
     """Update width/height based on preset selection"""
     if preset in PRESET_SIZES and PRESET_SIZES[preset]:
-        height, width = PRESET_SIZES[preset]  # Fixed: was width, height
+        height, width = PRESET_SIZES[preset]
         return (
             gr.update(value=height, interactive=preset=="Custom"),
             gr.update(value=width, interactive=preset=="Custom")
@@ -318,7 +395,7 @@ def update_dimensions(preset):
 # Create Gradio interface
 with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.colors.red, secondary_hue=gr.themes.colors.pink)) as demo:
     gr.Markdown("# 🎨 Fluxify")
-    gr.Markdown("Generate high-quality images using FLUX.1-dev model with advanced controls")
+    gr.Markdown("Generate high-quality images using FLUX.1-dev model with improved memory management")
     
     with gr.Row():
         with gr.Column(scale=1):
@@ -370,7 +447,7 @@ with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.co
                 
                 size_preset = gr.Dropdown(
                     choices=list(PRESET_SIZES.keys()),
-                    value="Portrait (832x1472)",
+                    value="Portrait (1472x832)",
                     label="Size Preset"
                 )
                 
@@ -394,6 +471,9 @@ with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.co
             with gr.Row():
                 generate_button = gr.Button("🚀 Generate", variant="primary", scale=2)
                 clear_button = gr.Button("🧹 Clear Cache", variant="secondary", scale=1)
+            
+            with gr.Row():
+                unload_button = gr.Button("🔄 Unload Pipeline", variant="secondary")
         
         with gr.Column(scale=2):
             # Prompt section (now at top of right column)
@@ -430,7 +510,7 @@ with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.co
             status_output = gr.Textbox(
                 label="Status", 
                 interactive=False,
-                lines=2
+                lines=3
             )
             
             export_status = gr.Textbox(
@@ -446,11 +526,11 @@ with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.co
     
     # Event handlers
     
-    # Update dimensions when preset changes - FIXED EVENT HANDLER
+    # Update dimensions when preset changes
     size_preset.change(
         fn=update_dimensions,
         inputs=[size_preset],
-        outputs=[height, width]  # Fixed: removed duplicate height, width
+        outputs=[height, width]
     )
     
     # Load prompt when selected from history
@@ -480,6 +560,12 @@ with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.co
         outputs=status_output
     )
     
+    # Unload pipeline
+    unload_button.click(
+        fn=force_unload_pipeline,
+        outputs=status_output
+    )
+    
     # Export prompts
     export_btn.click(
         fn=export_prompts,
@@ -502,8 +588,6 @@ if __name__ == "__main__":
         print("Shutting down...")
     finally:
         # Cleanup on exit
-        cleanup_memory()
-        if pipe is not None:
-            del pipe
-        if img2img_pipe is not None:
-            del img2img_pipe
+        with pipeline_lock:
+            unload_current_pipeline()
+            aggressive_cleanup()
