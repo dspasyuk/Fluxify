@@ -411,7 +411,7 @@ with gr.Blocks(title="Fluxify", theme=gr.themes.Default(primary_hue=gr.themes.co
                 
                 num_images = gr.Slider(
                     minimum=1, 
-                    maximum=5,
+                    maximum=20,
                     value=1, 
                     step=1, 
                     label="Number of Images"
